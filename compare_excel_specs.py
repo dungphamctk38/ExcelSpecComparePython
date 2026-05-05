@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from dataclasses import dataclass, asdict
+import math
 from pathlib import Path
 from typing import Any
 
@@ -101,7 +102,10 @@ def main() -> int:
         trim=not args.no_trim,
         ignore_case=args.ignore_case,
     )
-    write_excel_report(diffs, output)
+    try:
+        write_excel_report(diffs, output)
+    except PermissionError:
+        parser.error(f"Cannot write report: {output}. Close the file if it is open in Excel, then run again.")
 
     print(f"Compared: {old_file} -> {new_file}")
     print(f"Report: {output}")
@@ -124,6 +128,8 @@ def compare_excel_files(
 ) -> list[Diff]:
     old_wb = load_workbook(old_file, data_only=True)
     new_wb = load_workbook(new_file, data_only=True)
+    old_formula_wb = load_workbook(old_file, data_only=False)
+    new_formula_wb = load_workbook(new_file, data_only=False)
     diffs: list[Diff] = []
 
     old_sheets = set(old_wb.sheetnames)
@@ -140,22 +146,24 @@ def compare_excel_files(
 
         old_ws = old_wb[sheet]
         new_ws = new_wb[sheet]
-        keys = find_key_columns(old_ws, new_ws, mode, profile, key_columns, header_row)
+        old_formula_ws = old_formula_wb[sheet]
+        new_formula_ws = new_formula_wb[sheet]
+        keys = find_key_columns(old_ws, new_ws, old_formula_ws, new_formula_ws, mode, profile, key_columns, header_row)
 
         if keys:
-            diffs.extend(compare_sheet_by_key(old_ws, new_ws, keys, header_row, trim, ignore_case))
+            diffs.extend(compare_sheet_by_key(old_ws, new_ws, old_formula_ws, new_formula_ws, keys, header_row, trim, ignore_case))
         elif mode == "keyed" or key_columns:
             diffs.append(Diff(sheet=sheet, change_type="key_not_found", old_value="No key column found."))
         else:
-            diffs.extend(compare_sheet_by_cell(old_ws, new_ws, trim, ignore_case))
+            diffs.extend(compare_sheet_by_cell(old_ws, new_ws, old_formula_ws, new_formula_ws, trim, ignore_case))
 
     return diffs
 
 
-def compare_sheet_by_key(old_ws, new_ws, key_columns: list[str], header_row: int, trim: bool, ignore_case: bool) -> list[Diff]:
+def compare_sheet_by_key(old_ws, new_ws, old_formula_ws, new_formula_ws, key_columns: list[str], header_row: int, trim: bool, ignore_case: bool) -> list[Diff]:
     diffs: list[Diff] = []
-    old_headers = read_headers(old_ws, header_row)
-    new_headers = read_headers(new_ws, header_row)
+    old_headers = read_headers(old_ws, old_formula_ws, header_row)
+    new_headers = read_headers(new_ws, new_formula_ws, header_row)
     old_header_map = {normalize_header(name): col for col, name in old_headers.items()}
     new_header_map = {normalize_header(name): col for col, name in new_headers.items()}
 
@@ -167,8 +175,8 @@ def compare_sheet_by_key(old_ws, new_ws, key_columns: list[str], header_row: int
     for column in sorted(new_columns - old_columns):
         diffs.append(Diff(sheet=old_ws.title, change_type="column_added", column=new_headers[new_header_map[column]]))
 
-    old_rows = rows_by_key(old_ws, old_headers, key_columns, header_row)
-    new_rows = rows_by_key(new_ws, new_headers, key_columns, header_row)
+    old_rows = rows_by_key(old_ws, old_formula_ws, old_headers, key_columns, header_row)
+    new_rows = rows_by_key(new_ws, new_formula_ws, new_headers, key_columns, header_row)
     diffs.extend(duplicate_key_diffs(old_ws.title, old_rows, "old"))
     diffs.extend(duplicate_key_diffs(new_ws.title, new_rows, "new"))
 
@@ -216,12 +224,12 @@ def compare_sheet_by_key(old_ws, new_ws, key_columns: list[str], header_row: int
     return diffs
 
 
-def compare_sheet_by_cell(old_ws, new_ws, trim: bool, ignore_case: bool) -> list[Diff]:
+def compare_sheet_by_cell(old_ws, new_ws, old_formula_ws, new_formula_ws, trim: bool, ignore_case: bool) -> list[Diff]:
     diffs: list[Diff] = []
     for row in range(1, max(old_ws.max_row, new_ws.max_row) + 1):
         for col in range(1, max(old_ws.max_column, new_ws.max_column) + 1):
-            old_value = old_ws.cell(row=row, column=col).value
-            new_value = new_ws.cell(row=row, column=col).value
+            old_value = cell_value(old_ws, old_formula_ws, row, col)
+            new_value = cell_value(new_ws, new_formula_ws, row, col)
             if values_equal(old_value, new_value, trim, ignore_case):
                 continue
             diffs.append(
@@ -238,12 +246,12 @@ def compare_sheet_by_cell(old_ws, new_ws, trim: bool, ignore_case: bool) -> list
     return diffs
 
 
-def find_key_columns(old_ws, new_ws, mode: str, profile: str, key_columns: list[str], header_row: int) -> list[str]:
+def find_key_columns(old_ws, new_ws, old_formula_ws, new_formula_ws, mode: str, profile: str, key_columns: list[str], header_row: int) -> list[str]:
     if mode == "cell":
         return []
 
-    old_names = available_headers(old_ws, header_row)
-    new_names = available_headers(new_ws, header_row)
+    old_names = available_headers(old_ws, old_formula_ws, header_row)
+    new_names = available_headers(new_ws, new_formula_ws, header_row)
 
     if key_columns:
         return key_columns if all(normalize_header(col) in old_names and normalize_header(col) in new_names for col in key_columns) else []
@@ -261,17 +269,17 @@ def find_key_columns(old_ws, new_ws, mode: str, profile: str, key_columns: list[
     return []
 
 
-def read_headers(ws, header_row: int) -> dict[int, str]:
+def read_headers(ws, formula_ws, header_row: int) -> dict[int, str]:
     headers = {}
     for col in range(1, ws.max_column + 1):
-        value = ws.cell(row=header_row, column=col).value
+        value = cell_value(ws, formula_ws, header_row, col)
         if value is not None and str(value).strip():
             headers[col] = str(value).strip()
     return headers
 
 
-def available_headers(ws, header_row: int) -> dict[str, str]:
-    return {normalize_header(name): name for name in read_headers(ws, header_row).values()}
+def available_headers(ws, formula_ws, header_row: int) -> dict[str, str]:
+    return {normalize_header(name): name for name in read_headers(ws, formula_ws, header_row).values()}
 
 
 def first_common_header(old_names: dict[str, str], new_names: dict[str, str], aliases: list[str]) -> str:
@@ -282,16 +290,16 @@ def first_common_header(old_names: dict[str, str], new_names: dict[str, str], al
     return ""
 
 
-def rows_by_key(ws, headers: dict[int, str], key_columns: list[str], header_row: int) -> dict[str, dict[str, Any]]:
+def rows_by_key(ws, formula_ws, headers: dict[int, str], key_columns: list[str], header_row: int) -> dict[str, dict[str, Any]]:
     header_map = {normalize_header(name): col for col, name in headers.items()}
     key_indexes = [header_map[normalize_header(name)] for name in key_columns]
     rows = {}
 
     for row_number in range(header_row + 1, ws.max_row + 1):
-        row = {name: ws.cell(row=row_number, column=col).value for col, name in headers.items()}
+        row = {name: cell_value(ws, formula_ws, row_number, col) for col, name in headers.items()}
         if all(value is None or str(value).strip() == "" for value in row.values()):
             continue
-        key = " | ".join(display(ws.cell(row=row_number, column=col).value).strip() for col in key_indexes)
+        key = " | ".join(display(cell_value(ws, formula_ws, row_number, col)).strip() for col in key_indexes)
         key = key or f"blank_key_row_{row_number}"
         if key in rows:
             rows[key]["duplicate_rows"].append(row_number)
@@ -381,7 +389,7 @@ def normalize_header(value: str) -> str:
 
 
 def display(value: Any) -> str:
-    return "" if value is None else str(value)
+    return "" if is_blank_or_nan(value) else str(value)
 
 
 def row_preview(row: dict[str, Any]) -> str:
@@ -411,6 +419,28 @@ def auto_width(ws) -> None:
         column_letter = get_column_letter(column_cells[0].column)
         max_len = max(len(str(cell.value)) if cell.value is not None else 0 for cell in column_cells)
         ws.column_dimensions[column_letter].width = min(max(max_len + 2, 12), 80)
+
+
+def cell_value(value_ws, formula_ws, row: int, col: int) -> Any:
+    value = value_ws.cell(row=row, column=col).value
+    if not is_blank_or_nan(value):
+        return value
+
+    formula = formula_ws.cell(row=row, column=col).value
+    if is_formula(formula):
+        return formula
+
+    return ""
+
+
+def is_formula(value: Any) -> bool:
+    return isinstance(value, str) and value.startswith("=")
+
+
+def is_blank_or_nan(value: Any) -> bool:
+    if value is None:
+        return True
+    return isinstance(value, float) and math.isnan(value)
 
 
 if __name__ == "__main__":

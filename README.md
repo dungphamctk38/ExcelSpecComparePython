@@ -17,6 +17,12 @@ The Excel report is color coded:
 - Yellow: changed
 - Orange: warning
 
+Formula cells are handled with a fallback:
+
+- If Excel has saved a calculated value, the tool reads that value.
+- If the calculated value is blank/NaN, the tool reads the formula text, such as `=A2&B2`.
+- The tool does not calculate Excel formulas by itself.
+
 For structure/data type specs, it compares rows by:
 
 ```text
@@ -91,6 +97,7 @@ Use this table when you receive a new spec format and need to decide what to cha
 | You want to change report colors | Edit `ADDED_FILL`, `REMOVED_FILL`, `CHANGED_FILL`, or `WARNING_FILL`. | Change Excel color hex code |
 | You want to ignore some columns | Not supported yet. Add an ignore-column option or remove those columns before comparing. | `Updated Date`, `Author`, `Comment` |
 | Your file has duplicate keys | Check orange warning rows in the report. Duplicate keys should usually be fixed in the spec. | Same `Structure Name + Field Name` appears twice |
+| Formula cells show blank/NaN | Open the file in Excel, recalculate, save, then run again. If no cached value exists, the tool compares the formula text. | `=A2&B2` |
 
 ## Run the Example
 
@@ -105,6 +112,8 @@ Then open:
 ```text
 examples\struct_diff_report.xlsx
 ```
+
+Close the report file before running the command again. Excel locks opened `.xlsx` files, so the tool cannot overwrite a report that is currently open.
 
 ## Options
 
